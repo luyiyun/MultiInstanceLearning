@@ -9,10 +9,12 @@ import torchvision.transforms as transforms
 import progressbar as pb
 import pandas as pd
 import argparse
+import torch.utils.data as data
 
-from datasets import TctMilData, MilDataloader
-from networks import calcaulate_weight_for_batch, NormalCnn
+from datasets import MilData
+from networks import NormalCnn
 import metrics as mm
+from mil_weight import Weighter
 
 
 class NoneScheduler:
@@ -116,6 +118,8 @@ def train(
     }
     model.to(device)
 
+    weighter = Weighter(dataloaders['train'].dataset, device)
+
     for e in range(epoch):
         for phase in ['train', 'valid']:
             if phase == 'train':
@@ -130,7 +134,7 @@ def train(
                 'Loss: %(loss).4f', dict(loss=0.))
             widgets = [
                 prefix, " ",
-                pb.Counter(),
+                pb.Percentage(),
                 ' ', pb.SimpleProgress(
                     format='(%s)' % pb.SimpleProgress.DEFAULT_FORMAT
                 ),
@@ -143,21 +147,18 @@ def train(
 
             for m in metrics:
                 m.reset()
-            for batch_x, batch_y, batch_ids, batch_files in iterator:
+            for batch_x, batch_y, bag_ids, inst_ids in iterator:
                 batch_x = batch_x.to(device)
                 batch_y = batch_y.to(device)
                 optimizer.zero_grad()
                 with torch.set_grad_enabled(phase == 'train'):
-                    proba = model(batch_x)  # 注意模型输出的需要时proba
+                    proba = model(batch_x).squeeze()  # 注意模型输出的需要时proba
                     # 计算每个样本的权重
-                    weights = calcaulate_weight_for_batch(
-                        model, dataloaders[phase], batch_x, batch_ids,
-                        batch_files, verbose=True
-                    )
+                    w = weighter(proba, batch_y, bag_ids, inst_ids)
                     # 这个criterion不能reduction
-                    loss_es = criterion(proba, batch_y.to(torch.float))
+                    loss_es = criterion(proba, batch_y.float())
                     # 使用计算的权重
-                    loss = (loss_es * torch.tensor(weights)).mean()
+                    loss = (loss_es * w).mean()
                     # 只给weight加l2正则化
                     if l2 > 0.0:
                         for p_n, p_v in model.named_parameters():
@@ -175,7 +176,7 @@ def train(
                             m.add(loss.cpu().item(), batch_x.size(0))
                             format_custom_text.update_mapping(loss=m.value())
                         else:
-                            m.add(proba.squeeze(), batch_y, batch_ids)
+                            m.add(proba.squeeze(), batch_y, bag_ids)
 
             for m in metrics:
                 history[m.__class__.__name__+'_'+phase].append(m.value())
@@ -197,7 +198,7 @@ def train(
 
     print("Best metric: %.4f" % best_metric)
     model.load_state_dict(best_model_wts)
-    return model, history
+    return model, history, weighter
 
 
 def check_update_dirname(dirname):
@@ -259,7 +260,7 @@ def main():
     neg_dir = './DATA/TCT/negative'
     pos_dir = './DATA/TCT/positive'
 
-    dat = TctMilData.from2dir(neg_dir, pos_dir)
+    dat = MilData.from2dir(neg_dir, pos_dir)
     train_transfer = transforms.Compose([
         transforms.RandomHorizontalFlip(),
         transforms.RandomVerticalFlip(),
@@ -277,11 +278,11 @@ def main():
     train_dat, valid_dat = dat.split_by_patients(
         test_size, train_transfer=train_transfer, test_transfer=test_transfer)
     dataloaders = {
-        'train': MilDataloader(
+        'train': data.DataLoader(
             train_dat, batch_size=batch_size, num_workers=num_workers,
             shuffle=True
         ),
-        'valid': MilDataloader(
+        'valid': data.DataLoader(
             valid_dat, batch_size=batch_size, num_workers=num_workers,
         )
     }
@@ -300,13 +301,14 @@ def main():
     ]
 
     # ----- 训练网络 -----
-    net, hist = train(
+    net, hist, weighter = train(
         net, criterion, optimizer, dataloaders, epoch=epoch, metrics=scorings
     )
 
     # 保存结果
     dirname = check_update_dirname(save)
     torch.save(net.state_dict(), os.path.join(dirname, 'model.pth'))
+    torch.save(weighter, os.path.join(dirname, 'weigher.pth'))
     pd.DataFrame(hist).to_csv(os.path.join(dirname, 'train.csv'))
     with open(os.path.join(dirname, 'config.json'), 'w') as f:
         json.dump(args.__dict__, f)

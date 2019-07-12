@@ -50,13 +50,15 @@ class SklearnMeter:
         if self.tensor:
             output = output.detach().cpu().numpy()
             target = target.detach().cpu().numpy()
+            patientid = patientid.detach().cpu().numpy()
         self.outputs.append(output)
         self.targets.append(target)
-        self.ids += patientid
+        self.ids.append(patientid)
 
     def value(self):
         self.outputs = np.concatenate(self.outputs, axis=0)
         self.targets = np.concatenate(self.targets, axis=0)
+        self.ids = np.concatenate(self.ids, axis=0)
         self.results = pd.DataFrame({
             'output': self.outputs,
             'target': self.targets,
