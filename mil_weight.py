@@ -13,8 +13,10 @@ class Weighter:
         矩阵来储存proba，这样即便于计算也便于更新proba
     '''
 
-    def __init__(self, dataset, device=torch.device('cuda:0')):
+    def __init__(self, dataset, device=torch.device('cuda:0'), multipler = 2.):
         self.df = dataset.df
+        self.multipler = multipler
+        self.bag_le, self.inst_le = dataset.bags_le, dataset.instances_le
         # 因为bagid和instanceid都是唯一的，所有可以使用稀疏tensor来储存已经计算
         #   好的proba, 这里第一个维度是bag_id，第二个维度时instance_id
         i = torch.tensor(self.df[['bag_id', 'instance_id']].values).long().t()
@@ -43,8 +45,10 @@ class Weighter:
         with torch.no_grad():
             log_inv_proba_sum = (1 - self.p_tensor).log().mul(
                 self.mask_tensor).sum(dim=1)
-            delta = 1 / (log_inv_proba_sum[bags_id] - batch_proba.log()).exp() - 1
+            delta = 1 / (log_inv_proba_sum[bags_id] - batch_proba.log()).exp()
+            delta -= 1
             weight = batch_proba / (batch_proba + delta)
+            weight *= self.multipler
             weight = torch.max(weight, (1 - batch_target).float())
         return weight
 

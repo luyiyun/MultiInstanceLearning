@@ -74,17 +74,17 @@ def evaluate(
         m.reset()
     if bar:
         dataloader = pb.progressbar(dataloader, prefix='Test: ')
-    for batch_x, batch_y, batch_ids, batch_files in dataloader:
+    for batch_x, batch_y, bags_id, insts_id in dataloader:
         batch_x = batch_x.to(device)
         batch_y = batch_y.to(device)
         with torch.no_grad():
-            scores = model(batch_x)
-            loss = criterion(scores, batch_y)
+            scores = model(batch_x).squeeze()
+            loss = criterion(scores, batch_y.float()).mean()  # 这里时因为BCEloss
             for m in metrics:
                 if isinstance(m, mm.Loss):
                     m.add(loss.cpu().item(), batch_x.size(0))
                 else:
-                    m.add(scores.squeeze(), batch_y, batch_ids)
+                    m.add(scores.squeeze(), batch_y, bags_id)
     for m in metrics:
         history[m.__class__.__name__] = m.value()
     print(
@@ -103,13 +103,16 @@ def train(
     model, criterion, optimizer, dataloaders, scheduler=NoneScheduler(None),
     epoch=100, device=torch.device('cuda:0'), l2=0.0,
     metrics=(mm.Loss(),), standard_metric_index=1,
-    clip_grad=False
+    clip_grad=False, weighter_multipler=1.0
 ):
+    weighter = Weighter(
+        dataloaders['train'].dataset, device, multipler=weighter_multipler)
     # 构建几个变量来储存最好的模型
     best_model_wts = copy.deepcopy(model.state_dict())
     best_metric = 0.0
     best_metric_name = metrics[standard_metric_index].__class__.__name__ + \
         '_valid'
+    best_weighter = copy.deepcopy(weighter)  # 储存最好模型对应的weighter
     # 构建dict来储存训练过程中的结果
     history = {
         m.__class__.__name__+p: []
@@ -117,8 +120,6 @@ def train(
         for m in metrics
     }
     model.to(device)
-
-    weighter = Weighter(dataloaders['train'].dataset, device)
 
     for e in range(epoch):
         for phase in ['train', 'valid']:
@@ -195,19 +196,23 @@ def train(
                 if epoch_metric > best_metric:
                     best_metric = epoch_metric
                     best_model_wts = copy.deepcopy(model.state_dict())
+                    best_weighter = copy.deepcopy(weighter)
 
     print("Best metric: %.4f" % best_metric)
     model.load_state_dict(best_model_wts)
-    return model, history, weighter
+    return model, history, best_weighter
 
 
-def check_update_dirname(dirname):
+def check_update_dirname(dirname, indx=0):
     if os.path.exists(dirname):
-        dirname += '-'
-        check_update_dirname(dirname)
+        if indx > 0:
+            dirname = dirname[:-len(str(indx))]
+        indx += 1
+        dirname = dirname + str(indx)
+        dirname = check_update_dirname(dirname, indx)
     else:
         os.makedirs(dirname)
-        return dirname
+    return dirname
 
 
 def main():
@@ -223,12 +228,12 @@ def main():
         help='patch会被resize到多大，默认时224 x 224'
     )
     parser.add_argument(
-        '-ts', '--test_size', default=0.2, type=float,
-        help='测试集的大小，默认时0.2'
+        '-vts', '--valid_test_size', default=(0.1, 0.1), type=float, nargs=2,
+        help='训练集和测试集的大小，默认时0.1, 0.1'
     )
     parser.add_argument(
-        '-bs', '--batch_size', default=64, type=int,
-        help='batch size，默认时64'
+        '-bs', '--batch_size', default=32, type=int,
+        help='batch size，默认时32'
     )
     parser.add_argument(
         '-nw', '--num_workers', default=12, type=int,
@@ -246,15 +251,20 @@ def main():
         '--reduction', default='mean',
         help='聚合同一bag的instances时的聚合方式，默认时mean'
     )
+    parser.add_argument(
+        '--multipler', default=2.0, type=float,
+        help="为了平衡pos和neg，在weight再乘以一个大于1的数，默认是2.0"
+    )
     args = parser.parse_args()
     save = args.save
     image_size = (args.image_size, args.image_size)
-    test_size = args.test_size
+    valid_size, test_size = args.valid_test_size
     batch_size = args.batch_size
     num_workers = args.num_workers
     lr = args.learning_rate
     epoch = args.epoch
     reduction = args.reduction
+    multipler = args.multipler
 
     # ----- 读取数据 -----
     neg_dir = './DATA/TCT/negative'
@@ -275,8 +285,10 @@ def main():
         transforms.Normalize(
             mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
-    train_dat, valid_dat = dat.split_by_patients(
-        test_size, train_transfer=train_transfer, test_transfer=test_transfer)
+    train_dat, valid_dat, test_dat = dat.split_by_bag(
+        test_size, valid_size, train_transfer=train_transfer,
+        valid_transfer=test_transfer, test_transfer=test_transfer
+    )
     dataloaders = {
         'train': data.DataLoader(
             train_dat, batch_size=batch_size, num_workers=num_workers,
@@ -284,6 +296,9 @@ def main():
         ),
         'valid': data.DataLoader(
             valid_dat, batch_size=batch_size, num_workers=num_workers,
+        ),
+        'test': data.DataLoader(
+            test_dat, batch_size=batch_size, num_workers=num_workers,
         )
     }
 
@@ -292,18 +307,24 @@ def main():
     criterion = nn.BCELoss(reduction='none')
     optimizer = optim.Adam(net.parameters(), lr=lr)
     scorings = [
-        mm.Loss(), mm.ROCAUC(reduction=reduction),
+        mm.Loss(), mm.Recall(reduction=reduction),
+        mm.ROCAUC(reduction=reduction),
         mm.BalancedAccuracy(reduction=reduction),
         mm.F1Score(reduction=reduction),
         mm.Precision(reduction=reduction),
-        mm.Recall(reduction=reduction),
         mm.Accuracy(reduction=reduction)
     ]
 
     # ----- 训练网络 -----
-    net, hist, weighter = train(
-        net, criterion, optimizer, dataloaders, epoch=epoch, metrics=scorings
-    )
+    try:
+        net, hist, weighter = train(
+            net, criterion, optimizer, dataloaders, epoch=epoch, metrics=scorings,
+            weighter_multipler=multipler
+        )
+
+        test_hist = evaluate(net, dataloaders['test'], criterion, scorings)
+    except Exception as e:
+        import ipdb; ipdb.set_trace()  # XXX BREAKPOINT
 
     # 保存结果
     dirname = check_update_dirname(save)
@@ -312,6 +333,8 @@ def main():
     pd.DataFrame(hist).to_csv(os.path.join(dirname, 'train.csv'))
     with open(os.path.join(dirname, 'config.json'), 'w') as f:
         json.dump(args.__dict__, f)
+    with open(os.path.join(dirname, 'test.json'), 'w') as f:
+        json.dump(test_hist, f)
 
 
 if __name__ == "__main__":
