@@ -1,6 +1,7 @@
 import os
 import copy
 import json
+import warnings
 
 import torch
 import torch.nn as nn
@@ -216,6 +217,7 @@ def check_update_dirname(dirname, indx=0):
 
 
 def main():
+    warnings.filterwarnings('ignore')
 
     # config
     parser = argparse.ArgumentParser()
