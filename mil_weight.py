@@ -13,7 +13,7 @@ class Weighter:
         矩阵来储存proba，这样即便于计算也便于更新proba
     '''
 
-    def __init__(self, dataset, device=torch.device('cuda:0'), multipler = 2.):
+    def __init__(self, dataset, device=torch.device('cuda:0'), multipler=2.):
         self.df = dataset.df
         self.multipler = multipler
         self.bag_le, self.inst_le = dataset.bags_le, dataset.instances_le
@@ -21,7 +21,7 @@ class Weighter:
         #   好的proba, 这里第一个维度是bag_id，第二个维度时instance_id
         i = torch.tensor(self.df[['bag_id', 'instance_id']].values).long().t()
         # 初始所有样本的概率是0.5
-        v = torch.full((i.size(1),), 0.5)
+        v = torch.full((i.size(1),), 1.0)
         v_mask = torch.full((i.size(1),), 1).float()
         self.p_tensor = torch.sparse.FloatTensor(i, v).to_dense().to(device)
         # 设置一个mask tensor，用来防止在每个bag的instance数量不同时，会自动补充
